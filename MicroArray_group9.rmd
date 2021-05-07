@@ -1,0 +1,245 @@
+---
+title: "Project Genome Analysis"
+authors:
+- Kaho Cheng
+- Justine Claeys
+- Willem Orye
+- Lennert Verfaille
+output:
+  pdf_document: default
+  html_document: default
+subtitle: 'Transcription profiling by Affymetrix microarray of (1) normal and (2) hepatitis C induced liver cirrhosis liver tissue' 
+---
+
+```{r global_options, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(fig.align = 'center')
+knitr::opts_chunk$set(out.width = '60%')
+```
+E-MTAB-950 - Metastudy: Transcription profiling by array of human normal liver, HBV, HCV and haemochromatosis background cirrhotic and hematocellular carcinoma liver samples. For this analysis, only the data obtained using the P-G6764-1 Protocol.REF.2 are retained, in order to exclude the influence of the protocol used. In addition, only the data obtained from 'normal' and 'hepatitis C induced liver cirrhosis' liver tissues are maintained. This means that the data from the subjects with a 'hepatitis C virus induced hepatocellular carcinoma' are removed. Thus, the aim of this analysis is to compare the transcription profile of normal liver tissue and liver tissue with hepatitis C induced liver cirrhosis. 
+
+The necessary packages to analyze this dataset are the following:
+````{r}
+## Load packages
+# Packages for microarray data analysis
+library(arrayQualityMetrics)                              #Quality Control
+library(limma)                                            #Linear Models for Microarray Data => Differential expression
+library(oligo)                                            #All-In-One Preprocessing + Boxplot
+library(annotate)                                         #Annotation
+library(affy)
+library(tidyverse)
+library(ggplot2)                                          #Graph aesthetics
+````
+
+#Dataset 
+The whole dataset takes up 1.7 GB (zipped), and unzipped even more (probably ca. 6 GB). However, the whole dataset is divided into 12 zip files, and the data to be used (Protocol.REF.2 = "P-G6764-1" and Factor.Value.disease. = "hepatitis C induced liver cirrhosis" or "normal") is probably divided into fewer zip files. Therefore, to limit memory usage and run time, only the necessary zip files are downloaded. (Otherwise the automatic function ArrayExpress() would be much easier to load the dataset).
+```{r}
+##Make preselection matrix to select which samples are to be analyzed
+#(Down)load data overview
+ifelse(file.exists("dataoverview.txt"), "'dataoverview.txt' already downloaded", download.file(url = "https://www.ebi.ac.uk/arrayexpress/files/E-MTAB-950/E-MTAB-950.sdrf.txt", destfile = "./dataoverview.txt"))
+PS<-read.delim(file = "dataoverview.txt") 
+
+#Remove samples different from protocol (REF.2) "P-G6764-1" and "hepatitis C induced liver cirrhosis" or "normal" (R logic: "&" -> and; "|" -> or)
+PS<-subset(PS, PS$Protocol.REF.2 == "P-G6764-1" & (PS$Characteristics.DiseaseState. == "normal" | PS$Characteristics.DiseaseState. == "HCV induced cirrhosis"))
+
+row.names(PS)<-PS[,1]
+PS<-PS[sort(row.names(PS)),]
+PS
+```
+````{r}
+#Determining the required zip files *Run this chunk only if the zip files with the data are not downloaded.
+zip<-unique(PS$Comment..ArrayExpress.FTP.file.) #Returns vector of the download site of the zip files with duplicates removed
+length(zip) #Number of zip files required
+````
+
+From the column 'Comment..ArrayExpress.FTP.file' from the preselection matrix (PS) it is concluded that the data to be analyzed, are divided in two different zip files. Therefore, only these two zip files are downloaded. 
+```{r}
+##Download the zip files containing the data to be analyzed and unzip these. *Run this chunk ONLY if the needed zip files are not downloaded and unzipped, and the needed .CEL files are not moved to the folder "CEL".
+for(i in 1:(length(zip))){varname<-paste0("data_",i,".zip")
+  ifelse(file.exists(varname), NA, download.file(url= zip[i], destfile = varname))
+  unzip(varname)}
+remove("varname", "zip", "i")
+
+#Place the needed .CEL files in folder "CEL" and remove the unzipped not needed .CEL files
+ifelse(dir.exists("CEL"), "Folder 'CEL' already created", dir.create("CEL"))
+for(i in 1:(length(PS$Source.Name))){file.copy(PS$Source.Name[i], "CEL/")}
+unlink(list.files(pattern = ".CEL"))
+```
+
+The data to be analyzed is collected in a folder CEL and contains 23 samples (individual .CEL files). The samples can now be loaded into RStudio. 
+```{r}
+#Read .CEL files from folder "CEL" as an AffyBatch dataset
+rawData <- if(all(list.files("CEL")==PS[,1])){ReadAffy(celfile.path = "CEL/")}  else {"Folder 'CEL' do not contain all 23 .CEL files"} #If not all needed 23 .CEL files are present, 'rawData' cannot be analyzed by Affy.
+
+#Look at raw data
+head(exprs(rawData)) #Returns intensities for each well of the microarray (for each of the 23 samples)
+                                        
+head(probes(rawData)) #Returns intensities for each probe of the probeset (for each of the 23 samples)
+
+dim(probes(rawData))
+dim(exprs(rawData))
+```
+
+````{R}
+##Phenotype annotation
+#Replicate number allocation
+a<-c()
+j<-1 #Replicate number for "normal"
+k<-1 #Replicate number for "cirrhosis"
+for(i in 1:(length(PS[,1]))){if(PS$Characteristics.DiseaseState.[i] == "normal"){a<-c(a,j)
+  j<-j+1} else{a<-c(a,k)
+  k<-k+1}}
+PS$Cohorte_replicate<-a
+remove("a","i","j","k")
+
+#Population allocation
+PD<-data.frame(population = str_remove_all(PS$Characteristics.DiseaseState., "HCV induced "), replicate = PS$Cohorte_replicate) 
+rownames(PD)<-sampleNames(rawData)
+metaData<-data.frame(labelDiscription = c("population", "replicate"))
+phenoData(rawData)<-new("AnnotatedDataFrame", data = PD, varMetadata = metaData) #Add population and replicate column to phenotype data
+````
+
+#Quality Control on raw data
+After the data is loaded and selected, the microarrays are visually inspected and the package arrayQualityMetrics is used to perform Quality Control (QC) on the raw data.
+
+````{R}
+#Micro-array pictures
+for(i in 1:(length(PS[,1]))){affy::image(rawData[,i])}
+
+#All-In-One QC on raw data
+arrayQualityMetrics(expressionset = rawData, intgroup = "population", outdir="QC_raw", force = TRUE, do.logtransform = TRUE)
+````
+Exploration of the raw data using microarray pictures and all-in-one QC detected no visual anomalies, but outliers. As such, the box plots of two arrays exceeded the threshold and were considered outliers. To increase the data quality, Robust Multi-array Average (RMA)  preprocessing was implemented.
+
+#Preprocessing
+The RMA function from the affy package is used to perform several preprocessing tasks at once. These preprocessing tasks include background correction, normalisation and summarisation. After preprocessing, a second QC can be performed to make the difference visible. 
+````{r}
+# All-In-One Preprocessing
+PPData<-affy::rma(rawData) #Summarisation: summarizes multiple probe values in a single value per probeset (i.e. all probes that correspond to a “gene”) => Processed data: type ExpressionSet
+
+pData(PPData)
+````
+
+````{r}
+# All-In-One QC on processed data
+arrayQualityMetrics(expressionset = PPData, intgroup = "population", outdir="QC_PP", force = TRUE, do.logtransform = FALSE)
+````
+
+To demonstrate the effect of preprocessing, the box plots before and after preprocessing are compared. The box plots are colored according to the population, as an extra visual QC. Therefore, the package 'ggplot2' is used. The individual box plots are also available in the QCs.
+````{r}
+par(mfrow = c(1,2))
+
+for(i in 1:2){boxplot((if(i==1){rawData} else{PPData}), target = "core", las = 2, col = ifelse(PD$population=="normal", "blue", "red"), main = c("log2(raw data)", "RMA processed data")[i]) #Core" => summarized per gene/transcript <> "probeset" => summarized per probe set. https://bioconductor.org/packages/release/bioc/manuals/oligo/man/oligo.pdf #"transfo" is automatically set to "log2" if raw (FeatureSet) and to "identity" if processed (ExpressionSet).
+legend("top", legend= unique(PD$population), col= ifelse(PD$population== "normal", "blue", "red"), pch = 20, pt.cex = 2, inset = c(0,0.25))}
+````
+Altough a different outlier was shown after preprocessing, it was not removed to keep the number of replicates as high as possible for better statistical power. In general, the box plots, MA plots and density plots looked much more uniform. 
+
+#Differential expression
+Next, the moderated t-statistic as implemented in LIMMA is used to detect significant different probe set values.
+````{r}
+## Differential expression by LIMMA: first test
+PPData$population<-factor(PPData$population)
+design<-model.matrix(~replicate+population, data = PPData)
+
+fit<-lmFit(PPData, design)
+efit<-eBayes(fit)
+
+results<-decideTests(efit)
+summary(results) #Replicate does not influence results, up and down expression influenced by cirrhosis, FDR with BH 
+````
+
+````{r}
+## Differential expression by LIMMA: comparative analysis between normal en cirrhotic liver cells
+PPData$population<-factor(PPData$population)
+design<-model.matrix(~0+population, data = PPData)       
+design
+
+contr.matrix<-makeContrasts(Pop2Pop1 = populationnormal-populationcirrhosis, levels = colnames(design))
+contr.matrix
+
+fit<-lmFit(PPData, design)
+fit<-contrasts.fit(fit, contrasts = contr.matrix)
+efit<-eBayes(fit)
+
+MTS<-topTable(efit, sort.by = 'p', number = Inf)
+head(MTS, 15) #Shows 15 rows
+
+sum(MTS$P.Value < 0.05) #significant p-values no-FWER (alpha = 0.05)
+sum(MTS$adj.P.Val < 0.05) #significant q-values from FDR BH (alpha = 0.05)
+````
+
+````{r}
+limma::plotMA(efit) #MA plot
+abline(h=0, col="red") #Adding a red line for zero log-fold-change
+````
+
+````{r}
+volcanoplot(efit, highlight = 25) #Volcanoplot with the 25 probe sets with the most lowest p value highlighted
+
+ggplot(MTS, aes(x = logFC, y = -log10(adj.P.Val))) + geom_point()+
+  geom_point(data = subset(MTS, adj.P.Val<0.05),
+             aes(x = logFC, y = -log10(adj.P.Val)), color = "red") +
+  labs(title = "Volcanoplot", x = "log2 fold-change", y = "-log10(adjusted p value)") + 
+  geom_hline(yintercept = -log10(0.05), colour = "blue", linetype = "dashed") +
+  theme(plot.title = element_text(hjust = 0.5)) #Volcanoplot with all significant (adjusted p value < 0.05) marked in red, blue line is the adjusted p value = 0.05 line
+````
+
+````{r}
+#Distribution of non-FWER p-values: tail towards "p = 1" seems constant, probably no co-founders interfering in the non significant p value range
+plot(MyHist<-hist(MTS$P.Value, breaks= 100, plot= F), col= ifelse(MyHist$breaks <= 0.05, "red", "lightgray"), border = F , main = "Frequention histogram of the p values of probe sets" , xlab = "p value")
+legend("top", legend=c("probe sets with p value < 0.05","probe sets with p value > 0.05"), col = c("red", "lightgray"), pt.cex = 2, pch = 15)
+````
+
+````{r}
+#Distribution adjusted p values
+plot(MyHist<-hist(MTS$adj.P.Val, breaks= 100, plot= F), col= ifelse(MyHist$breaks <= 0.05, "red", "lightgray"), border = F , main = "Frequention histogram of the adjusted p values of probe sets" , xlab = "adjusted p value")
+legend("top", legend=c("probe sets with adjusted p value < 0.05","probe sets with adjusted p value > 0.05"), col = c("red", "lightgray"), pt.cex = 2, pch = 15)
+remove(MyHist)
+````
+
+````{r}
+annotation(PPData)
+ifelse(file.exists("annotation.txt"), "'annotation.txt' already downloaded", download.file(url = "https://www.ebi.ac.uk/arrayexpress/files/A-AFFY-44/A-AFFY-44.adf.txt", destfile = "./annotation.txt"))
+annot<-read.table("annotation.txt", sep = "\t", header = T, skip = 20, quote = "", fill = T)
+dim(annot)
+head(annot)
+tail(annot)
+colnames(annot)
+annot_sorted<-annot[sort(annot$Composite.Element.Name, index.return = TRUE)$ix,] #Sorting to correctly couple the names to the values. 
+annot_sorted 
+````
+
+````{r}
+MTS_sorted<-MTS[sort(rownames(MTS), index.return = TRUE)$ix,] #Same probe set name order as annot_sorted! 
+head(MTS_sorted)
+
+sum(rownames(MTS_sorted) == annot_sorted$Composite.Element.Name)
+
+MTS_sorted$Ensemble<-annot_sorted$Composite.Element.Database.Entry.ensembl. #Adding new column 'Ensemble' containing the elements of 'Composite.Element.Database.Entry.ensembl.' from annot_sorted. 
+
+MTS_annot<-MTS_sorted[sort(MTS_sorted$adj.P.Val, index.return = TRUE)$ix,] #Sorting results according to adj.P.Val (as initial)
+head(MTS_annot)
+````
+
+To analysis which processes are changed in cirrhotic cells compared to normal cells, significant probe sets (FDR BH adjusted p-value with alpha = 0.05) with abs(logFC) >= 1 and known Ensembl gene ID were selected.
+````{r}
+#Reminder: contrast of populationnormal-populationcirrhosis
+MTS_annot_sel<-subset(MTS_annot, MTS_annot$adj.P.Val<0.05 & abs(MTS_annot$logFC)>=1 & MTS_annot$Ensemble != "")
+write(MTS_annot_sel$Ensemble, "FC&.txt")
+
+MTS_annot_selp<-subset(MTS_annot, MTS_annot$adj.P.Val<0.05 & MTS_annot$logFC>=1 & MTS_annot$Ensemble != "")
+write(MTS_annot_selp$Ensemble, "FC+.txt") #>2 times more expression in normal cells compared to cirrhotic cells
+
+MTS_annot_seln<-subset(MTS_annot, MTS_annot$adj.P.Val<0.05 & MTS_annot$logFC<=-1 & MTS_annot$Ensemble != "")      
+write(MTS_annot_seln$Ensemble, "FC-.txt") #>2 times more expression in cirrhotic cells compared to normal cells
+````
+
+For analysis, the WEB-based GEne SeT AnaLysis Toolkit (WebGestalt) (http://www.webgestalt.org/) was used with the parameters presented in the next chunk
+````{r}
+#Organism of interest: Homo sapiens
+#Method of interest: Over-Representation Analysis (ORA)
+#Functional Database: geneontology + Biological Process
+
+#Select Gene ID Type: ensembl gene id
+#Upload Gene List: #"FC&.txt", "FC+.txt" & "FC-.txt" were separately uploaded
+#Select reference Set: affy hg u133 plus 2 #Name of the used Affymetrix microarray
+````
